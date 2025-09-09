@@ -1,170 +1,208 @@
+// Package glob adds a minimal "**" (recursive) glob on top of filepath semantics.
+// Usage:
+//   matches, err := glob.Glob(".", "src/**/test/*.go", nil)
 package glob
 
 import (
-    "errors"
-    "os"
-    "path/filepath"
-    "strings"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
 )
 
-/*
- * glob - an expanded version
- *
- * This implementation of globbing will still take advantage of the Glob
- * function in path/filepath, however this extends the pattern to include '**'
- *
- */
-
-/*
-Algorithm details
-
-segments = glob pattern split by os.path separator
-define Entry:
-    path, index into glob
-
-Base Case:
-    add Entry{root, 0}
-
-while num entries > 0
-    given an entry (path, idx)
-    given glob segment (gb) at idx
-
-    if gb == **
-        move cur entry idx + 1
-
-        for each dir inside path
-            add new Entry{dir, idx}
-    else
-        add gb to path
-        check for any results from normal globbing
-        if none
-            remove entry
-        else
-            if idx + 1 is out of bounds
-                add result to final list
-            else
-                add an entry{result, idx + 1}
-
-    keep current entry if it's idx is in bounds
-
- */
-
-type matchEntry struct {
-    path string
-    idx int
+type Opts struct {
+	FollowSymlinks bool // off by default; avoids cycles
+	IncludeFiles   bool // default true
+	IncludeDirs    bool // default true
+	Dot            bool // default false; match dotfiles only when pattern seg starts with '.'
 }
 
-func Glob(root string, pattern string) (matches []string, e error) {
-    if strings.Index(pattern, "**") < 0 {
-        return filepath.Glob(filepath.Join(root, pattern))
-    }
+func Glob(root, pattern string, o *Opts) ([]string, error) {
+	opts := applyDefaults(o)
 
-    segments := strings.Split(pattern, string(os.PathSeparator))
+	// Fast path: if there's no "**", let filepath.Glob do its thing.
+	if !strings.Contains(pattern, "**") {
+		return filepath.Glob(filepath.Join(root, pattern))
+	}
 
-    workingEntries := []matchEntry{
-        matchEntry{path: root, idx: 0},
-    }
+	// Normalize slashes for current OS and split on separator.
+	segs := split(filepath.FromSlash(pattern))
+	if len(segs) == 0 {
+		return nil, nil
+	}
 
-    for len(workingEntries) > 0 {
+	type qitem struct {
+		path string
+		i    int // next segment index
+	}
 
-        var temp []matchEntry
-        for _, entry := range workingEntries {
-            workingPath := entry.path
-            idx := entry.idx
-            segment := segments[entry.idx]
+	var (
+		work    = []qitem{{path: root, i: 0}}
+		results []string
+		seen    = map[string]struct{}{}
+	)
 
-            if segment == "**" {
-                // add all subdirectories and move yourself one step further
-                // into pattern
-                entry.idx++
+	for len(work) > 0 {
+		var next []qitem
+		for _, it := range work {
+			// Done consuming pattern? Decide if we emit this path.
+			if it.i >= len(segs) {
+				if emit(it.path, opts) {
+					if _, ok := seen[it.path]; !ok {
+						seen[it.path] = struct{}{}
+						results = append(results, it.path)
+					}
+				}
+				continue
+			}
 
-                subDirectories, err := getAllSubDirectories(entry.path)
+			seg := segs[it.i]
 
-                if err != nil {
-                    return nil, err
-                }
+			// "**" means: zero or more dirs.
+			if seg == "**" {
+				// Zero dirs:
+				next = append(next, qitem{path: it.path, i: it.i + 1})
 
-                for _, name := range subDirectories {
-                    path := filepath.Join(workingPath, name)
+				// Terminal "**" -> collect everything underneath (files + dirs).
+				if it.i+1 == len(segs) {
+					all, _ := collectAll(it.path, opts)
+					for _, p := range all {
+						if _, ok := seen[p]; !ok && emit(p, opts) {
+							seen[p] = struct{}{}
+							results = append(results, p)
+						}
+					}
+					// Don't enqueue more for this branch.
+					continue
+				}
 
-                    newEntry := matchEntry{
-                        path: path,
-                        idx: idx,
-                    }
+				// One-or-more dirs:
+				subs, _ := listSubdirs(it.path, opts.FollowSymlinks)
+				for _, name := range subs {
+					next = append(next, qitem{path: filepath.Join(it.path, name), i: it.i})
+				}
+				continue
+			}
 
-                    temp = append(temp, newEntry)
-                }
+			// Normal segment (literal/wildcards) within current dir.
+			ents, err := os.ReadDir(it.path)
+			if err != nil {
+				// Not a dir or unreadable; skip.
+				continue
+			}
+			for _, de := range ents {
+				name := de.Name()
+				ok, err := match(seg, name, opts.Dot)
+				if err != nil || !ok {
+					continue
+				}
+				next = append(next, qitem{
+					path: filepath.Join(it.path, name),
+					i:    it.i + 1,
+				})
+			}
+		}
+		work = next
+	}
 
-            } else {
-                // look at all results
-                // if we're at the end of the pattern, we found a match
-                // else add it to a working entry
-                path := filepath.Join(workingPath, segment)
-                results, err := filepath.Glob(path)
-
-                if err != nil {
-                    return nil, err
-                }
-
-                for _, result := range results {
-                    if idx + 1 < len(segments) {
-                        newEntry := matchEntry{
-                            path: result,
-                            idx: idx + 1,
-                        }
-
-                        temp = append(temp, newEntry)                        
-                    } else {
-                        matches = append(matches, result)
-                    }
-                }
-                // delete ourself regardless
-                entry.idx = len(segments)
-            }
-
-            // check whether current entry is still valid   
-            if entry.idx < len(segments) {
-                temp = append(temp, entry)
-            }
-        }
-
-        workingEntries = temp
-    }
-
-    return
+	sort.Strings(results)
+	return results, nil
 }
 
-func isDir(path string) (val bool, err error) {
-    fi, err := os.Stat(path)
-
-    if err != nil {
-        return false, err
-    }
-
-    return fi.IsDir(), nil
+func applyDefaults(o *Opts) *Opts {
+	if o == nil {
+		return &Opts{IncludeFiles: true, IncludeDirs: true}
+	}
+	cp := *o
+	if !cp.IncludeFiles && !cp.IncludeDirs {
+		cp.IncludeFiles = true // sensible default
+	}
+	return &cp
 }
 
-func getAllSubDirectories(path string) (dirs []string, err error) {
+func split(p string) []string {
+	if p == "" {
+		return nil
+	}
+	sep := string(filepath.Separator)
+	raw := strings.Split(p, sep)
+	out := make([]string, 0, len(raw))
+	for _, s := range raw {
+		if s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
 
-    if dir, err := isDir(path); err != nil || !dir {
-        return nil, errors.New("Not a directory " + path)
-    }
+func match(pattern, name string, dot bool) (bool, error) {
+	// No meta? literal compare is faster.
+	if !strings.ContainsAny(pattern, "*?[") {
+		return pattern == name, nil
+	}
+	// filepath.Glob rule: names starting with '.' only match when pattern starts with '.'
+	if !dot && strings.HasPrefix(name, ".") && !strings.HasPrefix(pattern, ".") {
+		return false, nil
+	}
+	return filepath.Match(pattern, name)
+}
 
-    d, err := os.Open(path)
-    if err != nil {
-        return nil, err
-    }
-    
-    files, err := d.Readdirnames(-1)
-    if err != nil {
-        return nil, err
-    }
+func listSubdirs(dir string, follow bool) ([]string, error) {
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(ents))
+	for _, de := range ents {
+		// Default: skip symlinked dirs to avoid loops.
+		if de.IsDir() {
+			if (de.Type()&fs.ModeSymlink) != 0 && !follow {
+				continue
+			}
+			if follow && (de.Type()&fs.ModeSymlink) != 0 {
+				// Only include if it actually points to a dir.
+				if info, err := os.Stat(filepath.Join(dir, de.Name())); err == nil && info.IsDir() {
+					out = append(out, de.Name())
+				}
+				continue
+			}
+			out = append(out, de.Name())
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
 
-    for _, file := range files {
-        path := filepath.Join(path, file)
-        if dir, err := isDir(path); err == nil && dir {
-            dirs = append(dirs, file)
-        }
-    }
-    return
+func collectAll(root string, o *Opts) ([]string, error) {
+	var out []string
+	// NOTE: WalkDir doesn't follow dir symlinks; fine unless FollowSymlinks=true is critical.
+	err := filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			// Skip unreadable branches; keep going.
+			return nil
+		}
+		// Skip symlinked dirs when not following.
+		if (d.Type()&fs.ModeSymlink) != 0 && !o.FollowSymlinks {
+			return nil
+		}
+		out = append(out, p)
+		return nil
+	})
+	if err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func emit(p string, o *Opts) bool {
+	fi, err := os.Lstat(p)
+	if err != nil {
+		return false
+	}
+	if fi.IsDir() {
+		return o.IncludeDirs
+	}
+	// Non-regular files (sockets, fifos, symlinks) count as "files" here.
+	return o.IncludeFiles
 }
